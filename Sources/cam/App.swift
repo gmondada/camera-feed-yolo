@@ -1,0 +1,763 @@
+internal import Foundation
+import Hummingbird
+import HummingbirdWebSocket
+import Logging
+import COnnxRuntime
+import CTurboJPEG
+import WendyLiteAVSource
+
+// ───────────────────────────────────────────────────────────────────────────
+// Constants
+// ───────────────────────────────────────────────────────────────────────────
+
+private let kInputSize: Int32 = 640
+
+private let kCocoNames: [String] = [
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog",
+    "horse","sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella",
+    "handbag","tie","suitcase","frisbee","skis","snowboard","sports ball","kite",
+    "baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle",
+    "wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich",
+    "orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch",
+    "potted plant","bed","dining table","toilet","tv","laptop","mouse","remote",
+    "keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book",
+    "clock","vase","scissors","teddy bear","hair drier","toothbrush",
+]
+
+
+private func envTruthy(_ name: String) -> Bool {
+    let v = (ProcessInfo.processInfo.environment[name] ?? "").lowercased()
+    return v == "true" || v == "1" || v == "yes"
+}
+
+private func isRpi() -> Bool {
+    let dev = ProcessInfo.processInfo.environment["WENDY_DEVICE_TYPE"] ?? ""
+    if dev.hasPrefix("raspberrypi") { return true }
+    if !dev.isEmpty { return false }
+    if let model = try? String(contentsOfFile: "/proc/device-tree/model", encoding: .utf8) {
+        return model.contains("Raspberry Pi")
+    }
+    return false
+}
+
+private let logger = Logger(label: "CameraFeedYoloApp")
+
+// ───────────────────────────────────────────────────────────────────────────
+// Box / Meta
+// ───────────────────────────────────────────────────────────────────────────
+
+struct Box: Codable, Sendable {
+    var x1: Float
+    var y1: Float
+    var x2: Float
+    var y2: Float
+    var conf: Float
+    var cls: Int
+    var name: String
+}
+
+struct Meta: Codable, Sendable {
+    var detections: Int
+    var inferenceMs: Double
+    var classes: [String: Int]
+    var boxes: [Box]
+    var frameW: Int
+    var frameH: Int
+
+    enum CodingKeys: String, CodingKey {
+        case detections
+        case inferenceMs = "inference_ms"
+        case classes
+        case boxes
+        case frameW = "frame_w"
+        case frameH = "frame_h"
+    }
+
+    static let empty = Meta(detections: 0, inferenceMs: 0, classes: [:], boxes: [], frameW: 0, frameH: 0)
+}
+
+private func iou(_ a: Box, _ b: Box) -> Float {
+    let ix1 = max(a.x1, b.x1), iy1 = max(a.y1, b.y1)
+    let ix2 = min(a.x2, b.x2), iy2 = min(a.y2, b.y2)
+    let iw = max(0, ix2 - ix1), ih = max(0, iy2 - iy1)
+    let inter = iw * ih
+    let aa = max(0, a.x2 - a.x1) * max(0, a.y2 - a.y1)
+    let bb = max(0, b.x2 - b.x1) * max(0, b.y2 - b.y1)
+    let u = aa + bb - inter
+    return u > 0 ? inter / u : 0
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// YoloEngine — wraps the ONNX Runtime C API.
+// ───────────────────────────────────────────────────────────────────────────
+
+private func ortApi() -> UnsafePointer<OrtApi> {
+    let base = OrtGetApiBase()!
+    let getApi = base.pointee.GetApi!
+    return getApi(UInt32(ORT_API_VERSION))!
+}
+
+private func checkStatus(_ status: OpaquePointer?, _ api: UnsafePointer<OrtApi>) throws {
+    guard let s = status else { return }
+    defer { api.pointee.ReleaseStatus(s) }
+    let cstr = api.pointee.GetErrorMessage(s)
+    let msg = cstr.map { String(cString: $0) } ?? "unknown ONNX Runtime error"
+    throw NSError(domain: "ort", code: 1, userInfo: [NSLocalizedDescriptionKey: msg])
+}
+
+// `final class` (not `actor`): actor's init and deinit are nonisolated, so
+// once `withCString` captures self mid-init the remaining stored-property
+// writes cross actor isolation, and deinit can't reach the C handles to
+// release them. Single consumer (the Task.detached in main); @unchecked
+// Sendable is the social contract that lets the engine move into that task.
+final class YoloEngine: @unchecked Sendable {
+    private let api: UnsafePointer<OrtApi>
+    private var env: OpaquePointer?
+    private var session: OpaquePointer?
+    private var memInfo: OpaquePointer?
+    private var allocator: UnsafeMutablePointer<OrtAllocator>?
+    private var inputName: UnsafeMutablePointer<CChar>?
+    private var outputName: UnsafeMutablePointer<CChar>?
+    private var inputNameStr: String = "images"
+    private var outputNameStr: String = "output0"
+    private let decoder: tjhandle?
+
+    init(modelPath: String, useGpu: Bool) throws {
+        self.api = ortApi()
+        self.decoder = tjInitDecompress()
+
+        var envPtr: OpaquePointer?
+        try checkStatus(api.pointee.CreateEnv(ORT_LOGGING_LEVEL_WARNING, "yolo", &envPtr), api)
+        self.env = envPtr
+
+        var optsPtr: OpaquePointer?
+        try checkStatus(api.pointee.CreateSessionOptions(&optsPtr), api)
+        defer { if let o = optsPtr { api.pointee.ReleaseSessionOptions(o) } }
+
+        try checkStatus(api.pointee.SetIntraOpNumThreads(optsPtr, 2), api)
+        try checkStatus(api.pointee.SetSessionGraphOptimizationLevel(optsPtr, ORT_ENABLE_ALL), api)
+
+        if useGpu {
+            // CUDA EP via the V2 options struct (rolls back gracefully if the
+            // runtime wasn't built with CUDA support).
+            var cudaOpts: OpaquePointer?
+            if api.pointee.CreateCUDAProviderOptions(&cudaOpts) == nil, let cuda = cudaOpts {
+                _ = api.pointee.SessionOptionsAppendExecutionProvider_CUDA_V2(optsPtr, cuda)
+                api.pointee.ReleaseCUDAProviderOptions(cuda)
+                logger.info("[yolo] CUDA execution provider requested")
+            } else {
+                logger.info("[yolo] CUDA EP unavailable — using CPU")
+            }
+        } else {
+            logger.info("[yolo] using CPU execution provider")
+        }
+
+        var sessionPtr: OpaquePointer?
+        try modelPath.withCString { cstr in
+            try checkStatus(api.pointee.CreateSession(envPtr, cstr, optsPtr, &sessionPtr), api)
+        }
+        self.session = sessionPtr
+
+        var allocPtr: UnsafeMutablePointer<OrtAllocator>?
+        try checkStatus(api.pointee.GetAllocatorWithDefaultOptions(&allocPtr), api)
+        self.allocator = allocPtr
+
+        var inName: UnsafeMutablePointer<CChar>?
+        try checkStatus(api.pointee.SessionGetInputName(sessionPtr, 0, allocPtr, &inName), api)
+        self.inputName = inName
+        if let n = inName { self.inputNameStr = String(cString: n) }
+
+        var outName: UnsafeMutablePointer<CChar>?
+        try checkStatus(api.pointee.SessionGetOutputName(sessionPtr, 0, allocPtr, &outName), api)
+        self.outputName = outName
+        if let n = outName { self.outputNameStr = String(cString: n) }
+
+        var memPtr: OpaquePointer?
+        try checkStatus(api.pointee.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memPtr), api)
+        self.memInfo = memPtr
+    }
+
+    deinit {
+        if let d = decoder { tjDestroy(d) }
+        if let n = inputName, let a = allocator { _ = api.pointee.AllocatorFree(a, n) }
+        if let n = outputName, let a = allocator { _ = api.pointee.AllocatorFree(a, n) }
+        if let m = memInfo { api.pointee.ReleaseMemoryInfo(m) }
+        if let s = session { api.pointee.ReleaseSession(s) }
+        if let e = env { api.pointee.ReleaseEnv(e) }
+    }
+
+    func infer(jpeg: Data, confThreshold: Float) -> (boxes: [Box], width: Int, height: Int)? {
+        guard let session = session, let memInfo = memInfo, let decoder = decoder else { return nil }
+
+        // Decode JPEG -> RGB.
+        var w: Int32 = 0, h: Int32 = 0, subsamp: Int32 = 0, colorspace: Int32 = 0
+        let decodeHeader = jpeg.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+            let ptr = raw.bindMemory(to: UInt8.self).baseAddress
+            return tjDecompressHeader3(decoder, ptr, UInt(jpeg.count), &w, &h, &subsamp, &colorspace)
+        }
+        guard decodeHeader == 0, w > 0, h > 0 else { return nil }
+
+        var rgb = [UInt8](repeating: 0, count: Int(w) * Int(h) * 3)
+        let decodeOk = jpeg.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+            let ptr = raw.bindMemory(to: UInt8.self).baseAddress
+            return rgb.withUnsafeMutableBufferPointer { dst in
+                tjDecompress2(decoder, ptr, UInt(jpeg.count), dst.baseAddress, w, 0, h, Int32(TJPF_RGB.rawValue), 0)
+            }
+        }
+        guard decodeOk == 0 else { return nil }
+
+        // Letterbox to kInputSize x kInputSize.
+        let scale = min(Float(kInputSize) / Float(w), Float(kInputSize) / Float(h))
+        let newW = Int(round(Float(w) * scale))
+        let newH = Int(round(Float(h) * scale))
+        let padX = (Int(kInputSize) - newW) / 2
+        let padY = (Int(kInputSize) - newH) / 2
+
+        let plane = Int(kInputSize) * Int(kInputSize)
+        var input = [Float](repeating: 114.0 / 255.0, count: 3 * plane)
+        let stride = Int(w) * 3
+        for y in 0..<newH {
+            let srcY = min(Int((Float(y) + 0.5) / scale), Int(h) - 1)
+            let rowOff = srcY * stride
+            for x in 0..<newW {
+                let srcX = min(Int((Float(x) + 0.5) / scale), Int(w) - 1)
+                let idx = rowOff + srcX * 3
+                let dstIdx = (padY + y) * Int(kInputSize) + (padX + x)
+                input[0 * plane + dstIdx] = Float(rgb[idx]) / 255.0
+                input[1 * plane + dstIdx] = Float(rgb[idx + 1]) / 255.0
+                input[2 * plane + dstIdx] = Float(rgb[idx + 2]) / 255.0
+            }
+        }
+
+        // Build the input tensor.
+        var shape: [Int64] = [1, 3, Int64(kInputSize), Int64(kInputSize)]
+        var inputTensor: OpaquePointer?
+        let tensorOk = input.withUnsafeMutableBufferPointer { ibuf -> Bool in
+            shape.withUnsafeMutableBufferPointer { sbuf in
+                let st = api.pointee.CreateTensorWithDataAsOrtValue(
+                    memInfo,
+                    ibuf.baseAddress,
+                    ibuf.count * MemoryLayout<Float>.size,
+                    sbuf.baseAddress,
+                    sbuf.count,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                    &inputTensor)
+                return st == nil
+            }
+        }
+        guard tensorOk, let inTensor = inputTensor else { return nil }
+        defer { api.pointee.ReleaseValue(inTensor) }
+
+        // Build the const-char-pointer arrays Swift-side; ORT expects
+        // (input_names, inputs, input_len, output_names, output_names_len, outputs).
+        let inNames: [UnsafePointer<CChar>?] = [inputName.map { UnsafePointer($0) }]
+        let outNames: [UnsafePointer<CChar>?] = [outputName.map { UnsafePointer($0) }]
+        let inValues: [OpaquePointer?] = [inTensor]
+        var outValues: [OpaquePointer?] = [nil]
+
+        let runOk = inNames.withUnsafeBufferPointer { inNamesBuf -> Bool in
+            outNames.withUnsafeBufferPointer { outNamesBuf -> Bool in
+                inValues.withUnsafeBufferPointer { inValuesBuf -> Bool in
+                    outValues.withUnsafeMutableBufferPointer { outValuesBuf -> Bool in
+                        let st = api.pointee.Run(
+                            session,
+                            nil,
+                            inNamesBuf.baseAddress,
+                            inValuesBuf.baseAddress,
+                            1,
+                            outNamesBuf.baseAddress,
+                            1,
+                            outValuesBuf.baseAddress)
+                        return st == nil
+                    }
+                }
+            }
+        }
+        guard runOk, let outVal = outValues[0] else { return nil }
+        defer { api.pointee.ReleaseValue(outVal) }
+
+        // Read the output tensor — expected shape (1, 84, N).
+        var info: OpaquePointer?
+        guard api.pointee.GetTensorTypeAndShape(outVal, &info) == nil, let infoPtr = info else { return nil }
+        defer { api.pointee.ReleaseTensorTypeAndShapeInfo(infoPtr) }
+
+        var dimCount: Int = 0
+        _ = api.pointee.GetDimensionsCount(infoPtr, &dimCount)
+        guard dimCount == 3 else { return nil }
+        var dims = [Int64](repeating: 0, count: dimCount)
+        _ = dims.withUnsafeMutableBufferPointer { api.pointee.GetDimensions(infoPtr, $0.baseAddress, dimCount) }
+        guard dims[1] >= 84 else { return nil }
+        let numAnchors = Int(dims[2])
+
+        var rawData: UnsafeMutableRawPointer?
+        guard api.pointee.GetTensorMutableData(outVal, &rawData) == nil, let basePtr = rawData else { return nil }
+        let preds = basePtr.bindMemory(to: Float.self, capacity: 84 * numAnchors)
+
+        var candidates: [Box] = []
+        candidates.reserveCapacity(256)
+        for i in 0..<numAnchors {
+            var bestCls = 0
+            var bestScore: Float = 0
+            for c in 0..<80 {
+                let s = preds[(4 + c) * numAnchors + i]
+                if s > bestScore { bestScore = s; bestCls = c }
+            }
+            if bestScore < confThreshold { continue }
+            let cx = preds[0 * numAnchors + i]
+            let cy = preds[1 * numAnchors + i]
+            let bw = preds[2 * numAnchors + i]
+            let bh = preds[3 * numAnchors + i]
+            let x1 = max(0, min(Float(w - 1), (cx - bw / 2 - Float(padX)) / scale))
+            let y1 = max(0, min(Float(h - 1), (cy - bh / 2 - Float(padY)) / scale))
+            let x2 = max(0, min(Float(w - 1), (cx + bw / 2 - Float(padX)) / scale))
+            let y2 = max(0, min(Float(h - 1), (cy + bh / 2 - Float(padY)) / scale))
+            candidates.append(Box(x1: x1, y1: y1, x2: x2, y2: y2, conf: bestScore, cls: bestCls, name: kCocoNames[bestCls]))
+        }
+        candidates.sort { $0.conf > $1.conf }
+        var kept: [Box] = []
+        for c in candidates {
+            if kept.contains(where: { $0.cls == c.cls && iou($0, c) > 0.45 }) { continue }
+            kept.append(c)
+            if kept.count >= 100 { break }
+        }
+        return (kept, Int(w), Int(h))
+    }
+}
+
+struct JPEGFrameParser: Sendable {
+    private var buffer = Data()
+    mutating func append(_ data: Data) -> [Data] {
+        // Cap before append so a malformed source can't grow the buffer past
+        // the limit before the next reset.
+        if buffer.count + data.count > 10_000_000 { buffer.removeAll() }
+        buffer.append(data)
+        var frames: [Data] = []
+        while let range = findFrame() {
+            frames.append(Data(buffer[range]))
+            buffer.removeSubrange(buffer.startIndex...range.upperBound)
+        }
+        return frames
+    }
+    private func findFrame() -> ClosedRange<Int>? {
+        guard buffer.count >= 4 else { return nil }
+        var soi: Int?
+        for i in buffer.startIndex..<(buffer.endIndex - 1) {
+            if buffer[i] == 0xFF && buffer[i + 1] == 0xD8 { soi = i; break }
+        }
+        guard let start = soi else { return nil }
+        for i in (start + 2)..<(buffer.endIndex - 1) {
+            if buffer[i] == 0xFF && buffer[i + 1] == 0xD9 { return start...(i + 1) }
+        }
+        return nil
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Camera info & enumeration
+// ───────────────────────────────────────────────────────────────────────────
+
+enum CameraAddress: Sendable, Equatable {
+    case v4l2(device: String)
+    case wendyLite(host: String, port: Int)
+}
+
+struct CameraInfo: Codable, Sendable {
+    let id: String
+    let name: String
+}
+
+struct Camera: Sendable {
+    let info: CameraInfo
+    let address: CameraAddress
+}
+
+func listCameras() -> [Camera] {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/v4l2-ctl")
+    process.arguments = ["--list-devices"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return []
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else { return [] }
+    var cameras: [Camera] = []
+    var currentName: String?
+    for line in output.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if !line.hasPrefix("\t") && !line.hasPrefix(" ") && trimmed.hasSuffix(":") {
+            currentName = String(trimmed.dropLast())
+        } else if trimmed.hasPrefix("/dev/video") {
+            let id = "v4l:" + trimmed
+            cameras.append(Camera(info: CameraInfo(id: id, name: currentName ?? trimmed), address: .v4l2(device: trimmed)))
+        }
+    }
+    cameras.append(contentsOf: AVSourceDiscovery.shared.listCameras().map { info in
+        Camera(info: CameraInfo(id: info.id, name: info.name), address: .wendyLite(host: info.host, port: info.port))
+    })
+    return cameras
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// MJPEGCamera actor — owns the gst-launch-1.0 process + tracks subscribers.
+// ───────────────────────────────────────────────────────────────────────────
+
+actor MJPEGCamera {
+    private let useWendyLite = false
+    private var subscribers: [ObjectIdentifier: @Sendable (Data, String) async -> Void] = [:]
+    private var pipelineTask: Task<Void, any Error>?
+    private var currentCameraAddress: CameraAddress = .v4l2(device: "/dev/video0")
+    private let usePassthrough: Bool
+    private var latestJpeg: Data?
+    private var latestMetaJson: String = "{\"detections\":0,\"inference_ms\":0,\"classes\":{},\"boxes\":[],\"frame_w\":0,\"frame_h\":0}"
+    private var inferenceCallback: (@Sendable (Data) async -> Void)?
+    
+    init(address: CameraAddress = .v4l2(device: "/dev/video0"), usePassthrough: Bool) {
+        self.currentCameraAddress = address
+        self.usePassthrough = usePassthrough
+    }
+
+    func setInferenceCallback(_ cb: @escaping @Sendable (Data) async -> Void) {
+        self.inferenceCallback = cb
+    }
+
+    func updateMeta(_ json: String) {
+        self.latestMetaJson = json
+    }
+
+    func currentMeta() -> String { latestMetaJson }
+
+    func subscribe(id: ObjectIdentifier, handler: @escaping @Sendable (Data, String) async -> Void) {
+        subscribers[id] = handler
+        if subscribers.count == 1 { startPipeline() }
+    }
+
+    func unsubscribe(id: ObjectIdentifier) {
+        subscribers.removeValue(forKey: id)
+        if subscribers.isEmpty { stopPipeline() }
+    }
+
+    func switchCamera(to address: CameraAddress) {
+        logger.info("[mjpeg-cam] switch camera to \(address)")
+        guard address != currentCameraAddress else { return }
+        currentCameraAddress = address
+        if !subscribers.isEmpty { stopPipeline(); startPipeline() }
+    }
+
+    private func broadcast(_ frame: Data) async {
+        latestJpeg = frame
+        let meta = latestMetaJson
+        let handlers = Array(subscribers.values)
+        let cb = inferenceCallback
+
+        await withTaskGroup(of: Void.self) { group in
+            for handler in handlers {
+                group.addTask {
+                    await handler(frame, meta)
+                }
+            }
+            if let cb {
+                group.addTask {
+                    await cb(frame)
+                }
+            }
+        }
+    }
+
+    private func startPipeline() {
+        logger.info("[mjpeg-cam] start pipeline")
+        switch currentCameraAddress {
+            case .wendyLite(let host, let port):
+                // AVSource is its own actor, so wiring it up has to hop off this
+                // one — hence the Task rather than a straight-line call.
+                pipelineTask = Task {
+                    while !Task.isCancelled {
+                        let source = AVSource(host: host, port: port)
+                        // Weak here and not on the Task: the source retains this
+                        // handler, so a strong capture would cycle back through
+                        // wendyLiteCam.
+                        let sub = await source.subscribeToVideoFrames { [weak self] frame in
+                            await self?.broadcast(frame.jpeg)
+                        }
+                        do {
+                            logger.info("[avsource] starting...")
+                            try await source.start()
+                        } catch {
+                            logger.info("[avsource] connect failed: \(error)")
+                            await source.unsubscribe(sub)
+                            try await Task.sleep(for: .milliseconds(5000))
+                            continue;
+                        }
+
+                        while await source.isConnected && !Task.isCancelled {
+                            do { try await Task.sleep(for: .milliseconds(1000)) } catch { break }
+                        }
+
+                        await source.stop()
+                        await source.unsubscribe(sub)
+                    }
+                    logger.info("[avsource] stopped")
+                }
+            case .v4l2(let device):
+                let passthrough = usePassthrough
+                pipelineTask = Task {
+                    var delayMs: UInt64 = 1000
+                    while !Task.isCancelled {
+                        guard self.hasSubscribers() else { return }
+                        do {
+                            try await self.runGStreamerPipeline(device: device, passthrough: passthrough)
+                        } catch is CancellationError {
+                            return
+                        } catch {
+                            logger.info("[gst] pipeline error: \(error)")
+                        }
+                        if Task.isCancelled { return }
+                        guard self.hasSubscribers() else { return }
+                        logger.info("[gst] retrying pipeline in \(delayMs)ms")
+                        do {
+                            try await Task.sleep(for: .milliseconds(delayMs))
+                        } catch {
+                            return
+                        }
+                        delayMs = min(UInt64(Double(delayMs) * 1.5), 5000)
+                    }
+                }
+        }
+    }
+
+    private func hasSubscribers() -> Bool { !subscribers.isEmpty }
+
+    private func stopPipeline() {
+        logger.info("[mjpeg-cam] stop pipeline")
+        pipelineTask?.cancel()
+        pipelineTask = nil
+    }
+
+    private func runGStreamerPipeline(device: String, passthrough: Bool) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/gst-launch-1.0")
+        // Passthrough on RPi/CPU avoids a 30fps decode/re-encode brown-out under
+        // GStreamer + inference load. Jetson keeps the decode/encode for quality
+        // since it has hardware JPEG codecs.
+        if passthrough {
+            process.arguments = [
+                "v4l2src", "device=\(device)", "!",
+                "image/jpeg", "!",
+                "fdsink", "fd=1",
+            ]
+        } else {
+            process.arguments = [
+                "v4l2src", "device=\(device)", "!",
+                "image/jpeg", "!",
+                "jpegdec", "!",
+                "jpegenc", "quality=85", "!",
+                "fdsink", "fd=1",
+            ]
+        }
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        try process.run()
+
+        // gst-launch reports failures (missing device, caps negotiation, …) on
+        // stderr only, so surface them instead of dropping them on the floor.
+        let errHandle = errPipe.fileHandleForReading
+        errHandle.readabilityHandler = { fh in
+            let data = fh.availableData
+            guard !data.isEmpty else { fh.readabilityHandler = nil; return }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.split(whereSeparator: \.isNewline) where !line.isEmpty {
+                logger.info("[gst] \(line)")
+            }
+        }
+        defer { errHandle.readabilityHandler = nil }
+
+        let handle = pipe.fileHandleForReading
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        handle.readabilityHandler = { fh in
+            let data = fh.availableData
+            if data.isEmpty { continuation.finish() } else { continuation.yield(data) }
+        }
+        defer { handle.readabilityHandler = nil }
+
+        var parser = JPEGFrameParser()
+
+        for await chunk in stream {
+            if Task.isCancelled { break }
+            let frames = parser.append(chunk)
+            for frame in frames {
+                await self.broadcast(frame)
+            }
+        }
+
+        process.terminate()
+
+        // SIGTERM gets two grace periods, then we stop asking nicely. The sleep
+        // is detached because this teardown usually runs in an already-cancelled
+        // task, where a plain Task.sleep would throw at once and leave the child
+        // holding /dev/video0.
+        var waited = 0
+        while process.isRunning {
+            if waited >= 50 {
+                logger.info("[mjpeg-cam] gave up waiting for gst process (pid \(process.processIdentifier)) after \(waited * 100)ms")
+                break
+            }
+            if waited == 2 {
+                logger.info("[mjpeg-cam] gst process ignored SIGTERM, sending SIGKILL")
+                kill(process.processIdentifier, SIGKILL)
+            }
+            logger.info("[mjpeg-cam] waiting gst process to terminate")
+            await Task.detached { _ = try? await Task.sleep(for: .milliseconds(100)) }.value
+            waited += 1
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Confidence holder (separate actor so it can be mutated from WS handler).
+// ───────────────────────────────────────────────────────────────────────────
+
+actor ConfidenceState {
+    private var value: Float = 0.25
+    func get() -> Float { value }
+    func set(_ v: Float) { value = max(0.05, min(0.95, v)) }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Application
+// ───────────────────────────────────────────────────────────────────────────
+
+private struct ClientCommand: Decodable {
+    let switch_camera: String?
+    let confidence: Float?
+}
+
+@main
+struct CameraFeedYoloApp {
+
+    static func main() async throws {
+        let useGpu = envTruthy("WENDY_HAS_GPU")
+        let rpi = isRpi()
+        let usePassthrough = !useGpu || rpi
+        let minIntervalMs: UInt64 = useGpu ? UInt64(1000 / 15) : UInt64(1000 / 3)
+
+        logger.info("Started")
+
+        logger.info("[startup] platform=\(ProcessInfo.processInfo.environment["WENDY_PLATFORM"] ?? "unknown"), has_gpu=\(useGpu), is_rpi=\(rpi), capture=\(usePassthrough ? "passthrough" : "decode-encode")")
+
+        let camera = MJPEGCamera(address: .v4l2(device: "/dev/video0"), usePassthrough: usePassthrough)
+        let confidence = ConfidenceState()
+
+        let engine: YoloEngine
+        do {
+            engine = try YoloEngine(modelPath: "yolov8n.onnx", useGpu: useGpu)
+            logger.info("[yolo] model loaded")
+        } catch {
+            logger.info("[yolo] failed to load model: \(error)")
+            exit(1)
+        }
+
+        let pendingFrames = AsyncStream.makeStream(of: Data.self, bufferingPolicy: .bufferingNewest(1))
+        let cont = pendingFrames.continuation
+        await camera.setInferenceCallback { frame in
+            cont.yield(frame)
+        }
+
+        // ── HTTP routes ──
+        let router = Router()
+        router.get("/cameras") { _, _ in listCameras().map { $0.info } }
+        router.get("/", use: spaHandler(staticDir: "."))
+        router.get("{path+}", use: spaHandler(staticDir: "."))
+
+        // ── WebSocket /stream ──
+        let wsRouter = Router(context: BasicWebSocketRequestContext.self)
+        wsRouter.ws("/stream") { inbound, outbound, _ in
+            final class ConnectionID: Sendable {}
+            let connID = ConnectionID()
+            let id = ObjectIdentifier(connID)
+
+            await camera.subscribe(id: id) { frame, metaJson in
+                do {
+                    try await outbound.write(.text(metaJson))
+                    try await outbound.write(.binary(ByteBuffer(bytes: frame)))
+                } catch {
+                    logger.info("[ws] write failed: \(error)")
+                }
+            }
+
+            do {
+                for try await message in inbound.messages(maxSize: 1_048_576) {
+                    if case .text(let text) = message {
+                        guard let data = text.data(using: .utf8) else { continue }
+                        do {
+                            let cmd = try JSONDecoder().decode(ClientCommand.self, from: data)
+                            if let id = cmd.switch_camera {
+                                if let cam = listCameras().first(where: { $0.info.id == id }) {
+                                    await camera.switchCamera(to: cam.address)
+                                }
+                            }
+                            if let c = cmd.confidence {
+                                await confidence.set(c)
+                                logger.info("[yolo] confidence -> \(c)")
+                            }
+                        } catch {
+                            logger.info("[ws] malformed client message: \(error)")
+                        }
+                    }
+                }
+            } catch {
+                logger.info("[ws] inbound loop error: \(error)")
+            }
+
+            await camera.unsubscribe(id: id)
+        }
+
+        let app = Application(
+            router: router,
+            server: .http1WebSocketUpgrade(webSocketRouter: wsRouter),
+            configuration: .init(address: .hostname("0.0.0.0", port: 6006))
+        )
+
+        logger.info("Camera feed (YOLO) running on http://0.0.0.0:6006")
+
+        try await withThrowingDiscardingTaskGroup { group in
+            group.addTask {
+                let clock = ContinuousClock()
+                var lastRun = clock.now - .milliseconds(Int(minIntervalMs) + 1)
+                for await frame in pendingFrames.stream {
+                    let now = clock.now
+                    let elapsed = now - lastRun
+                    let remaining = Duration.milliseconds(Int(minIntervalMs)) - elapsed
+                    if remaining > .zero { try? await Task.sleep(for: remaining) }
+                    let conf = await confidence.get()
+                    let t0 = clock.now
+                    guard let (boxes, w, h) = engine.infer(jpeg: frame, confThreshold: conf) else { continue }
+                    let elapsed2 = clock.now - t0
+                    let inferenceMs = Double(elapsed2.components.seconds) * 1000.0
+                        + Double(elapsed2.components.attoseconds) / 1_000_000_000_000_000.0
+                    lastRun = clock.now
+                    var classes: [String: Int] = [:]
+                    for b in boxes { classes[b.name, default: 0] += 1 }
+                    let meta = Meta(
+                        detections: boxes.count,
+                        inferenceMs: (inferenceMs * 10).rounded() / 10,
+                        classes: classes, boxes: boxes, frameW: w, frameH: h)
+                    if let s = try? String(data: JSONEncoder().encode(meta), encoding: .utf8) {
+                        await camera.updateMeta(s)
+                    }
+                }
+            }
+            group.addTask {
+                defer { cont.finish() }
+                try await app.runService()
+            }
+        }
+    }
+}

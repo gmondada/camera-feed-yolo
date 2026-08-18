@@ -1,0 +1,52 @@
+// swift-tools-version: 6.2
+
+import PackageDescription
+
+let package = Package(
+    name: "cam",
+    platforms: [.macOS(.v14)],
+    products: [
+        .library(name: "WendyLiteAVSource", targets: ["WendyLiteAVSource"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.21.1"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.0.0"),
+        .package(url: "https://github.com/apple/swift-container-plugin", from: "1.0.0"),
+        // Already in the graph through Hummingbird, but SwiftPM needs it
+        // declared directly for a target to reference its products.
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.14.0"),
+    ],
+    targets: [
+        .systemLibrary(
+            name: "COnnxRuntime",
+            pkgConfig: "libonnxruntime"
+        ),
+        .systemLibrary(
+            name: "CTurboJPEG",
+            pkgConfig: "libturbojpeg"
+        ),
+        .executableTarget(
+            name: "cam",
+            dependencies: [
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
+                .product(name: "Logging", package: "swift-log"),
+                "COnnxRuntime",
+                "CTurboJPEG",
+                "WendyLiteAVSource",
+            ]
+        ),
+        .target(
+            name: "WendyLiteAVSource",
+            dependencies: [
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+            ]
+        ),
+        .executableTarget(
+            name: "cam-mac",
+            dependencies: ["WendyLiteAVSource"]
+        ),
+    ]
+)

@@ -4,11 +4,16 @@ import NIOPosix
 
 /// AVSource — connects to a wendy-lite AV source and pulls video frames.
 ///
-/// The device answers one request with one frame, and queues at most one
-/// pending request, so the loop keeps exactly one request in flight: ask,
-/// reassemble, hand the frame out, ask again.
+/// The device answers one request with one frame, and queues one request
+/// behind the one it is serving, so the loop keeps two requests pending: the
+/// next capture starts the moment the current frame finishes going out, rather
+/// than waiting on our reassembly, our handlers, and a request round trip.
 public actor AVSource {
     public static let defaultPort = 3_333
+
+    // The device serves one request and queues at most one more, so two in
+    // flight keeps it busy end to end. A third would just park in a buffer.
+    private static let pendingRequestCount = 2
 
     private let host: String
     private let port: Int
@@ -92,7 +97,7 @@ public actor AVSource {
         isConnected = false
     }
 
-    // ── private ──
+    //=== private ===//
 
     private func markDisconnected() {
         isConnected = false
@@ -101,19 +106,35 @@ public actor AVSource {
     private func stream(over channel: NIOAsyncChannel<AVMessage, ByteBuffer>) async throws {
         try await channel.executeThenClose { inbound, outbound in
             var assembler = FrameAssembler()
-            var pendingRequestID = try await self.requestFrame(on: outbound)
+
+            // Request IDs in the order they went out. TCP keeps frames in that
+            // same order, so the head is the one the next frame should carry.
+            var pending: [UInt32] = []
+            while pending.count < Self.pendingRequestCount {
+                pending.append(try await self.requestFrame(on: outbound))
+            }
 
             for try await message in inbound {
                 if Task.isCancelled { return }
 
                 guard let frame = try assembler.accept(message) else { continue }
-                if frame.requestID != pendingRequestID {
-                    print("[avsource] frame \(frame.number) answers request 0x\(String(frame.requestID, radix: 16)), expected 0x\(String(pendingRequestID, radix: 16))")
+                // An empty queue means the device sent a frame we never asked
+                // for, worth a line in the log but not worth trapping over.
+                let expected = pending.isEmpty ? nil : pending.removeFirst()
+                if frame.requestID != expected {
+                    let expectedText = expected.map { "0x\(String($0, radix: 16))" } ?? "none"
+                    print("[avsource] frame \(frame.number) answers request 0x\(String(frame.requestID, radix: 16)), expected \(expectedText)")
                 }
 
-                await self.broadcast(frame)
+                // Refills before handing the frame out: waiting until the
+                // handlers return would leave the device idle for exactly as
+                // long as they take.
+                while pending.count < Self.pendingRequestCount {
+                    pending.append(try await self.requestFrame(on: outbound))
+                }
+
                 if Task.isCancelled { return }
-                pendingRequestID = try await self.requestFrame(on: outbound)
+                await self.broadcast(frame)
             }
 
             throw AVSourceError.connectionClosed

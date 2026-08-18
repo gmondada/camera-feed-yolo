@@ -27,7 +27,7 @@ let package = Package(
             pkgConfig: "libturbojpeg"
         ),
         .executableTarget(
-            name: "cam",
+            name: "camera-feed-yolo",
             dependencies: [
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),

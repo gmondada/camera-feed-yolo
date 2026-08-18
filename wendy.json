@@ -1,5 +1,5 @@
 {
-    "appId": "cam",
+    "appId": "camera-feed-yolo",
     "version": "0.1.0",
     "platform": "linux",
     "entitlements": [

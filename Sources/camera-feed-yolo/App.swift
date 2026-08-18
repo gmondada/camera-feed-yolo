@@ -648,8 +648,6 @@ struct CameraFeedYoloApp {
         let usePassthrough = !useGpu || rpi
         let minIntervalMs: UInt64 = useGpu ? UInt64(1000 / 15) : UInt64(1000 / 3)
 
-        logger.info("Started")
-
         logger.info("[startup] platform=\(ProcessInfo.processInfo.environment["WENDY_PLATFORM"] ?? "unknown"), has_gpu=\(useGpu), is_rpi=\(rpi), capture=\(usePassthrough ? "passthrough" : "decode-encode")")
 
         let camera = MJPEGCamera(address: .v4l2(device: "/dev/video0"), usePassthrough: usePassthrough)

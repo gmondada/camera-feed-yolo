@@ -118,9 +118,9 @@ ENV WENDY_PLATFORM=${WENDY_PLATFORM} \
 WORKDIR /app
 COPY Package.swift ./
 COPY Sources Sources
-RUN --mount=type=cache,id=swiftpm-cam,target=/app/.build \
+RUN --mount=type=cache,id=swiftpm-camera-feed-yolo,target=/app/.build \
     swift build -c release \
- && cp ".build/release/cam" /usr/local/bin/cam
+ && cp ".build/release/camera-feed-yolo" /usr/local/bin/camera-feed-yolo
 
 COPY --from=model-export /export/yolov8n.onnx ./yolov8n.onnx
 COPY index.html ./
@@ -128,4 +128,4 @@ COPY assets/ ./assets/
 
 EXPOSE 6006
 
-CMD ["cam"]
+CMD ["camera-feed-yolo"]

@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "cam",
+    name: "camera-feed-yolo",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "WendyLiteAVSource", targets: ["WendyLiteAVSource"]),

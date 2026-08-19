@@ -117,13 +117,24 @@ public actor AVSource {
             for try await message in inbound {
                 if Task.isCancelled { return }
 
+                // Anything else is a type we do not handle — a reserved one, a
+                // handshake answer — and PROTOCOL.md has us read on past it.
+                guard message.type == kMessageTypeData else { continue }
+
                 guard let frame = try assembler.accept(message) else { continue }
-                // An empty queue means the device sent a frame we never asked
-                // for, worth a line in the log but not worth trapping over.
-                let expected = pending.isEmpty ? nil : pending.removeFirst()
-                if frame.requestID != expected {
-                    let expectedText = expected.map { "0x\(String($0, radix: 16))" } ?? "none"
-                    print("[avsource] frame \(frame.number) answers request 0x\(String(frame.requestID, radix: 16)), expected \(expectedText)")
+                // A device with no room for a request discards it silently, so
+                // a frame can answer one further down the queue. Everything
+                // ahead of the match went unanswered and will never come.
+                if let index = pending.firstIndex(of: frame.requestID) {
+                    if index > 0 {
+                        print("[avsource] \(index) request(s) dropped by the device before frame \(frame.number)")
+                    }
+                    pending.removeFirst(index + 1)
+                } else {
+                    // A frame we never asked for, or one for a request already
+                    // accounted for: worth a line in the log, not worth
+                    // trapping over, and nothing to remove from the queue.
+                    print("[avsource] frame \(frame.number) answers unknown request 0x\(String(frame.requestID, radix: 16))")
                 }
 
                 // Refills before handing the frame out: waiting until the

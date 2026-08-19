@@ -1,22 +1,25 @@
 internal import Foundation
 import NIOCore
 
-/// Collects the run of type 2 messages that make up one frame. Chunks travel
+/// Collects the run of type 4 messages that make up one frame. Chunks travel
 /// over TCP so they cannot arrive out of order or be dropped silently: a gap
 /// means the stream is out of sync, which is worth surfacing rather than
 /// papering over with a partial image.
+///
+/// Takes data messages only; the caller filters the types it does not handle.
 struct FrameAssembler: Sendable {
     private var expectedChunk: UInt32 = 0
     private var jpeg = Data()
 
     mutating func accept(_ message: AVMessage) throws -> VideoFrame? {
-        guard message.type == kMessageTypeData else {
-            throw AVSourceError.unexpectedMessageType(message.type)
+        // A payload too short for the layout its type calls for is ignored,
+        // like a message of an unknown type, per PROTOCOL.md.
+        guard message.payload.readableBytes >= kDataHeaderLength else {
+            return nil
         }
 
         var payload = message.payload
-        guard payload.readableBytes >= kDataHeaderLength,
-              let channel: UInt8 = payload.readInteger(),
+        guard let channel: UInt8 = payload.readInteger(),
               let high: UInt8 = payload.readInteger(),
               let mid: UInt8 = payload.readInteger(),
               let low: UInt8 = payload.readInteger(),

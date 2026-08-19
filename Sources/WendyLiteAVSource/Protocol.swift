@@ -3,39 +3,22 @@ import NIOCore
 // ───────────────────────────────────────────────────────────────────────────
 // Wire format
 //
-// Mirrors the device side, xiao-esp32s3-camera-stream/main/server.h. Every
-// message is a 4 byte header followed by a payload, all multi-byte fields in
-// network order:
+// Specified in Doc/PROTOCOL.md, which is the reference for message layouts,
+// field semantics and error handling. The constants below must agree with it.
 //
-//   offset 0: magic (kMagic)
-//   offset 1: message type
-//   offset 2: payload size (16 bits)
-//
-// Type 1, request, us to the device, 12 byte payload:
-//
-//   offset  0: channel
-//   offset  1: number of frames (ignored by the device for now)
-//   offset  2: reserved
-//   offset  4: delay in microseconds since the last frame (ignored for now)
-//   offset  8: request id, echoed back in every chunk of the frame
-//
-// Type 2, data, the device to us, 20 byte payload plus image data:
-//
-//   offset  0: channel
-//   offset  1: last_chunk flag (1 bit) then chunk number (23 bits)
-//   offset  4: frame number
-//   offset  8: frame timestamp in microseconds
-//   offset 12: host timestamp in microseconds
-//   offset 16: request id
-//   offset 20: image data
+// That file is a copy of the one in xiao-esp32s3-camera-stream, the device
+// repository, which holds the source of truth; the device side reads the same
+// constants out of it in main/server.h.
 // ───────────────────────────────────────────────────────────────────────────
 
 let kMagic: UInt8 = 0xAF
 let kHeaderLength = 4
-let kMaxMessageLength = 1_280
+let kMaxMessageLength = 1_408
 
-let kMessageTypeRequest: UInt8 = 1
-let kMessageTypeData: UInt8 = 2
+// Type 0 is the handshake, which is optional and which this client does not
+// send. Types 1 and 2 are reserved.
+let kMessageTypeRequest: UInt8 = 3
+let kMessageTypeData: UInt8 = 4
 
 let kChannelVideo: UInt8 = 1
 
@@ -90,7 +73,7 @@ struct AVMessageDecoder: ByteToMessageDecoder {
 // Encoder
 // ───────────────────────────────────────────────────────────────────────────
 
-// Builds a type 1 message asking for a single video frame. The device ignores
+// Builds a type 3 message asking for a single video frame. The device ignores
 // the frame count and the delay today, so they are pinned at 1 and 0.
 func makeVideoRequest(requestID: UInt32, allocator: ByteBufferAllocator) -> ByteBuffer {
     var buffer = allocator.buffer(capacity: kHeaderLength + kRequestPayloadLength)

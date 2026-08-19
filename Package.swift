@@ -42,7 +42,10 @@ let package = Package(
             dependencies: [
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
-            ]
+            ],
+            // Reference material for whoever reads the source, not something to
+            // ship in a bundle, so excluded rather than declared a resource.
+            exclude: ["Doc"]
         ),
         .executableTarget(
             name: "cam-mac",

@@ -22,7 +22,6 @@ public enum AVSourceError: Error, Sendable {
     case malformedFrame
     case unexpectedChannel(UInt8)
     case unexpectedChunk(expected: UInt32, got: UInt32)
-    case unexpectedMessageType(UInt8)
     case connectionClosed
     case alreadyRunning
 }

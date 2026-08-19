@@ -1,4 +1,4 @@
-public import Foundation
+import Foundation
 
 /// One complete video frame, reassembled from the chunks the device sent for a
 /// single request.

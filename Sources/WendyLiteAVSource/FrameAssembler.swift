@@ -1,4 +1,4 @@
-internal import Foundation
+import Foundation
 import NIOCore
 
 /// Collects the run of type 4 messages that make up one frame. Chunks travel

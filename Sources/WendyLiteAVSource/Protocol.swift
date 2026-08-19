@@ -86,12 +86,5 @@ func makeVideoRequest(requestID: UInt32, allocator: ByteBufferAllocator) -> Byte
     buffer.writeInteger(UInt16(0))
     buffer.writeInteger(UInt32(0))
     buffer.writeInteger(requestID)
-    eprint("[avsource] request frame 0x\(String(requestID, radix: 16)) type=\(kMessageTypeRequest)")
     return buffer
-}
-
-
-func eprint(_ items: Any..., separator: String = " ", terminator: String = "\n") {
-    let output = items.map { "\($0)" }.joined(separator: separator) + terminator
-    FileHandle.standardError.write(output.data(using: .utf8)!)
 }
